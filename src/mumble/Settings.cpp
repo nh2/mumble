@@ -391,7 +391,8 @@ Settings::Settings() {
 #if defined(AUDIO_TEST)
 	lmLoopMode = Server;
 #else
-	lmLoopMode = None;
+	// lmLoopMode = None;
+	lmLoopMode = Server;
 #endif
 	dPacketLoss = 0;
 	dMaxPacketDelay = 0.0f;

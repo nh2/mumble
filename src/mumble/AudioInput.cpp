@@ -102,11 +102,16 @@ AudioInput::AudioInput() : opusBuffer(g.s.iFramesPerPacket * (SAMPLE_RATE / 100)
 		}
 
 		oCodec->opus_encoder_ctl(opusState, OPUS_SET_VBR(0)); // CBR
+
+		// Forward error correctoin
+		oCodec->opus_encoder_ctl(opusState, OPUS_SET_INBAND_FEC(1));
+		const int expected_packet_loss_percent = 50;
+		oCodec->opus_encoder_ctl(opusState, OPUS_SET_PACKET_LOSS_PERC(expected_packet_loss_percent));
 	}
 #endif
 
 #ifdef USE_RNNOISE
-	denoiseState = rnnoise_create();
+	denoiseState = rnnoise_create(NULL);
 #endif
 
 	qWarning("AudioInput: %d bits/s, %d hz, %d sample", iAudioQuality, iSampleRate, iFrameSize);

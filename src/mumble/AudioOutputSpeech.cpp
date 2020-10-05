@@ -3,6 +3,7 @@
 // that can be found in the LICENSE file at the root of the
 // Mumble source tree or at <https://www.mumble.info/LICENSE>.
 
+#include <iostream>
 #include "mumble_pch.hpp"
 
 #include "AudioOutputSpeech.h"
@@ -25,6 +26,8 @@ AudioOutputSpeech::AudioOutputSpeech(ClientUser *user, unsigned int freq, Messag
 	dsSpeex = NULL;
 	oCodec = NULL;
 	opusState = NULL;
+	opusIsLastPacketLost = false;
+	seqNoToDecode = -1;
 
 	bHasTerminator = false;
 	bStereo = false;
@@ -110,6 +113,8 @@ AudioOutputSpeech::~AudioOutputSpeech() {
 void AudioOutputSpeech::addFrameToBuffer(const QByteArray &qbaPacket, unsigned int iSeq) {
 	QMutexLocker lock(&qmJitter);
 
+	int frames;
+
 	if (qbaPacket.size() < 2)
 		return;
 
@@ -136,8 +141,12 @@ void AudioOutputSpeech::addFrameToBuffer(const QByteArray &qbaPacket, unsigned i
 
 #ifdef USE_OPUS
 		if (oCodec) {
-			int frames = oCodec->opus_packet_get_nb_frames(packet, size);
+			frames = oCodec->opus_packet_get_nb_frames(packet, size);
 			samples = frames * oCodec->opus_packet_get_samples_per_frame(packet, SAMPLE_RATE);
+
+			packets[iSeq] = qba;
+			std::cerr << "packets.size() = " << packets.size() << std::endl;
+			// TODO prune the map
 		}
 #else
 		return;
@@ -162,14 +171,21 @@ void AudioOutputSpeech::addFrameToBuffer(const QByteArray &qbaPacket, unsigned i
 		jbp.span = samples;
 		jbp.timestamp = iFrameSize * iSeq;
 
+		std::cerr << "addFrameToBuffer(iseq = " << iSeq << "); frames: " << frames << std::endl;
+
 		jitter_buffer_put(jbJitter, &jbp);
 	}
 }
 
 bool AudioOutputSpeech::needSamples(unsigned int snum) {
+	std::cerr << "\nneedSamples(snum = " << snum << "); iLastConsume = " << iLastConsume << "; iBufferFilled = " << iBufferFilled << std::endl;
+	// std::cerr << "iSampleRate " << iSampleRate << " iFrameSize " << iFrameSize << std::endl;
+
 	for (unsigned int i=iLastConsume;i<iBufferFilled;++i)
 		pfBuffer[i-iLastConsume]=pfBuffer[i];
 	iBufferFilled -= iLastConsume;
+
+	std::cerr << "  new iBufferFilled = " << iBufferFilled << std::endl;
 
 	iLastConsume = snum;
 
@@ -195,9 +211,11 @@ bool AudioOutputSpeech::needSamples(unsigned int snum) {
 			int avail = 0;
 			int ts = jitter_buffer_get_pointer_timestamp(jbJitter);
 			jitter_buffer_ctl(jbJitter, JITTER_BUFFER_GET_AVAILABLE_COUNT, &avail);
+			std::cerr << "resampler: " << (!!srs) << " ts " << ts << "; avail = " << avail << std::endl;
 
 			if (p && (ts == 0)) {
 				int want = iroundf(p->fAverageAvailable);
+				std::cerr << "want = " << want << std::endl;
 				if (avail < want) {
 					++iMissCount;
 					if (iMissCount < 20) {
@@ -208,6 +226,8 @@ bool AudioOutputSpeech::needSamples(unsigned int snum) {
 			}
 
 			if (qlFrames.isEmpty()) {
+				std::cerr << "packet missing" << std::endl;
+
 				QMutexLocker lock(&qmJitter);
 
 				char data[4096];
@@ -217,7 +237,12 @@ bool AudioOutputSpeech::needSamples(unsigned int snum) {
 
 				spx_int32_t startofs = 0;
 
+				seqNoToDecode++;
+
 				if (jitter_buffer_get(jbJitter, &jbp, iFrameSize, &startofs) == JITTER_BUFFER_OK) {
+					unsigned int iSeq = jbp.timestamp / iFrameSize;
+					std::cerr << "  - from jitter buffer; startofs = " << startofs << "; iSeq = " << iSeq << "; seqNoToDecode = " << seqNoToDecode << std::endl;
+					Q_ASSERT(iSeq == seqNoToDecode);
 					PacketDataStream pds(jbp.data, jbp.len);
 
 					iMissCount = 0;
@@ -257,6 +282,11 @@ bool AudioOutputSpeech::needSamples(unsigned int snum) {
 							p->fAverageAvailable *= 0.99f;
 					}
 				} else {
+					std::cerr << "  - missing" << std::endl;
+
+					// TODO nh2: Get the next packet out with `jitter_buffer_get()`
+					//  				 Better idea: keep a `JitterBufferPacket packets[N]` array ourselves, because jitter_buffer does not allow us to just peek at the next packet.
+
 					jitter_buffer_update_delay(jbJitter, &jbp, NULL);
 
 					iMissCount++;
@@ -264,6 +294,8 @@ bool AudioOutputSpeech::needSamples(unsigned int snum) {
 						nextalive = false;
 				}
 			}
+
+			std::cerr << "qlFrames.size() = " << qlFrames.size() << std::endl;
 
 			if (! qlFrames.isEmpty()) {
 				QByteArray qba = qlFrames.takeFirst();
@@ -357,7 +389,28 @@ bool AudioOutputSpeech::needSamples(unsigned int snum) {
 				} else if (umtType == MessageHandler::UDPVoiceOpus) {
 #ifdef USE_OPUS
 					if (oCodec) {
-						decodedSamples = oCodec->opus_decode_float(opusState, NULL, 0, pOut, iFrameSize, 0);
+						const auto& it = packets.find(seqNoToDecode + 1);
+						bool nextPacketExists = (it != packets.end());
+						// bool nextPacketExists = false;
+
+						if (nextPacketExists) {
+							std::cerr << "Decoding packet with Opus FEC" << std::endl;
+
+							const QByteArray &qba = it->second;
+							decodedSamples = oCodec->opus_decode_float(opusState,
+							                                           qba.isEmpty() ?
+							                                               NULL :
+							                                               reinterpret_cast<const unsigned char *>(qba.constData()),
+							                                           qba.size(),
+							                                           pOut,
+							                                           iAudioBufferSize,
+							                                           1);
+						} else {
+							std::cerr << "packet missing, using loss concealment" << std::endl;
+
+							// Packet lost; pass NULL for Opus loss concealment.
+							decodedSamples = oCodec->opus_decode_float(opusState, NULL, 0, pOut, iFrameSize, 0);
+						}
 					}
 
 					if (decodedSamples < 0) {
@@ -391,6 +444,8 @@ nextframe:
 			speex_resampler_process_float(srs, 0, fResamplerBuffer, &inlen, pfBuffer + iBufferFilled, &outlen);
 		iBufferFilled += outlen;
 	}
+
+	std::cerr << "while (iBufferFilled < snum) over\n" << std::endl;
 
 	if (p) {
 		Settings::TalkState ts;

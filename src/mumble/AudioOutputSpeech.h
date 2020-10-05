@@ -47,6 +47,8 @@ class AudioOutputSpeech : public AudioOutputUser {
 
 		QMutex qmJitter;
 		JitterBuffer *jbJitter;
+		std::map<unsigned int, QByteArray> packets;
+		unsigned int seqNoToDecode;
 		int iMissCount;
 
 		CELTCodec *cCodec;
@@ -54,6 +56,7 @@ class AudioOutputSpeech : public AudioOutputUser {
 
 		OpusCodec *oCodec;
 		OpusDecoder *opusState;
+		bool opusIsLastPacketLost;
 
 		SpeexBits sbBits;
 		void *dsSpeex;
